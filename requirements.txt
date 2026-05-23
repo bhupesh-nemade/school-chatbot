@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+halo
+pinecone
+langchain-community
+langchain-openai
+langchain-pinecone
+langchain-text-splitters
+pypdf
