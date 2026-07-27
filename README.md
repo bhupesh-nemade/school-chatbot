@@ -1,6 +1,6 @@
 # School Chatbot
 
-This project provides a document-based school chatbot using LangChain, Pinecone, and OpenRouter. The original terminal chat is still available, and `app.py` adds a Streamlit UI.
+This project provides a document-based school chatbot using LangChain, Pinecone, and OpenRouter. The original terminal chat is still available, `app.py` adds a Streamlit UI, and `api.py` exposes the same RAG pipeline through FastAPI.
 
 ## Setup
 
@@ -29,6 +29,35 @@ HF_TOKEN=your_huggingface_token
 
 ```powershell
 streamlit run app.py
+```
+
+## Run FastAPI Backend
+
+```powershell
+uvicorn api:app --reload --host 127.0.0.1 --port 8000
+```
+
+Send a chat request:
+
+```powershell
+curl -X POST "http://127.0.0.1:8000/chat" `
+  -H "Content-Type: application/json" `
+  -d "{\"question\":\"What is the admission process?\"}"
+```
+
+Response shape:
+
+```json
+{
+  "answer": "...",
+  "sources": [
+    {
+      "source": "FAQ_Handbook.pdf",
+      "page": "3",
+      "preview": "..."
+    }
+  ]
+}
 ```
 
 ## Run Terminal Chat
