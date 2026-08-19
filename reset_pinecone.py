@@ -1,7 +1,7 @@
 from pinecone import Pinecone
-from config import PINECONE_API_KEY
+from config import PINECONE_API_KEY,PINECONE_INDEX_NAME
 
-INDEX_NAME = "school-chatbot-index"
+INDEX_NAME = PINECONE_INDEX_NAME
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 

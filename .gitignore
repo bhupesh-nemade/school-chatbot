@@ -1,8 +1,42 @@
+# Virtual environment
+chatbot_env/
 venv/
+.venv/
+
+# Environment variables
 .env
+.env.*
+!.env.example
+
+# Python cache
 __pycache__/
-*.pyc
-.streamlit/
-.idea/
+*.py[cod]
+*.pyo
+
+# Pytest
+.pytest_cache/
+
+# IDEs
 .vscode/
+.idea/
+
+# Logs
 *.log
+
+# Streamlit
+.streamlit/
+
+# Evaluation outputs
+evaluation_results.csv
+ragas_summary.csv
+installed_packages_backup.txt
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python tooling
+.mypy_cache/
+.ruff_cache/
+
