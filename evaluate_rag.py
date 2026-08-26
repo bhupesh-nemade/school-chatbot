@@ -5,33 +5,66 @@ import csv
 import json
 import logging
 import math
+import statistics
+import time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
-from chatbot.chain import ask_question, get_llm
-from chatbot.rag_service import DEFAULT_MODEL
-from chatbot.retriever import get_embedding_model
+from chatbot.chain import (
+    ask_question,
+    get_llm,
+)
+from chatbot.retriever import (
+    get_embedding_model,
+)
+from config import DEFAULT_MODEL
 
-LOGGER = logging.getLogger(__name__)
+
+LOGGER = logging.getLogger(
+    __name__
+)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Configuration
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-DEFAULT_INPUT_PATH = "new_evaluation_dataset.csv"
-DEFAULT_RESULTS_PATH = "evaluation_results.csv"
-DEFAULT_SUMMARY_PATH = "ragas_summary.csv"
+DEFAULT_INPUT_PATH = (
+    "new_evaluation_dataset.csv"
+)
+
+DEFAULT_RESULTS_PATH = (
+    "evaluation_results.csv"
+)
+
+DEFAULT_SUMMARY_PATH = (
+    "ragas_summary.csv"
+)
 
 EVAL_USER_ID = "ragas_test"
 
-REQUESTED_METRIC_ORDER = [
+
+RAGAS_METRICS = [
     "faithfulness",
     "answer_relevancy",
     "context_precision",
     "context_recall",
 ]
+
+
+PERFORMANCE_METRICS = [
+    "average_latency_ms",
+    "p50_latency_ms",
+    "p95_latency_ms",
+    "p99_latency_ms",
+    "average_input_tokens",
+    "average_output_tokens",
+    "average_total_tokens",
+    "average_tokens_per_second",
+    "success_rate",
+    "error_rate",
+]
+
 
 RESULT_COLUMNS = [
     "question",
@@ -45,18 +78,28 @@ RESULT_COLUMNS = [
     "retrieved_count",
     "context_count",
     "memory_count",
+
+    # RAGAS
     "faithfulness",
     "answer_relevancy",
     "context_precision",
     "context_recall",
+
+    # Performance
+    "latency_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "tokens_per_second",
 ]
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Logging
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def setup_logging() -> None:
+
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -67,49 +110,40 @@ def setup_logging() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # CLI
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def parse_args() -> argparse.Namespace:
+
     parser = argparse.ArgumentParser(
         description=(
-            "Run the School Chatbot production RAG pipeline "
-            "and evaluate it with RAGAS."
+            "Evaluate the School Chatbot "
+            "RAG pipeline."
         )
     )
 
     parser.add_argument(
         "--input",
         default=DEFAULT_INPUT_PATH,
-        help=(
-            "Evaluation CSV containing "
-            "question,ground_truth."
-        ),
     )
 
     parser.add_argument(
         "--results-output",
         default=DEFAULT_RESULTS_PATH,
-        help=(
-            "Per-question evaluation output CSV."
-        ),
     )
 
     parser.add_argument(
         "--summary-output",
         default=DEFAULT_SUMMARY_PATH,
-        help=(
-            "Aggregate RAGAS summary CSV."
-        ),
     )
 
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=(
-            "Model used for chatbot generation "
-            "and RAGAS evaluation."
+            "LLM model used by the chatbot "
+            "and RAGAS evaluator."
         ),
     )
 
@@ -118,22 +152,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Evaluate only the first N questions. "
-            "0 means all questions."
+            "Number of questions to evaluate. "
+            "0 means all."
         ),
     )
 
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Dataset
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def load_eval_rows(
     path: Path,
 ) -> list[dict[str, str]]:
+
     if not path.exists():
+
         raise FileNotFoundError(
             f"Evaluation dataset not found: {path}"
         )
@@ -143,40 +179,56 @@ def load_eval_rows(
         encoding="utf-8-sig",
         newline="",
     ) as csv_file:
-        reader = csv.DictReader(csv_file)
+
+        reader = csv.DictReader(
+            csv_file
+        )
 
         fieldnames = set(
             reader.fieldnames or []
         )
 
-        missing = {
+        required = {
             "question",
             "ground_truth",
-        } - fieldnames
+        }
+
+        missing = (
+            required - fieldnames
+        )
 
         if missing:
+
             raise ValueError(
-                "Evaluation CSV is missing required "
-                f"columns: {sorted(missing)}"
+                "Evaluation CSV is missing "
+                f"required columns: "
+                f"{sorted(missing)}"
             )
 
-        rows: list[dict[str, str]] = []
+        rows = []
 
         for row in reader:
+
             question = (
-                row.get("question")
+                row.get(
+                    "question"
+                )
                 or ""
             ).strip()
 
             ground_truth = (
-                row.get("ground_truth")
+                row.get(
+                    "ground_truth"
+                )
                 or ""
             ).strip()
 
             if not question:
+
                 LOGGER.warning(
-                    "Skipping empty evaluation question."
+                    "Skipping empty question."
                 )
+
                 continue
 
             rows.append(
@@ -189,32 +241,32 @@ def load_eval_rows(
         return rows
 
 
-# ---------------------------------------------------------------------------
-# RAG result extraction
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Document helpers
+# ============================================================================
 
 def doc_to_context(
     doc: Any,
 ) -> str:
-    page_content = getattr(
-        doc,
-        "page_content",
-        "",
-    )
 
     return str(
-        page_content
+        getattr(
+            doc,
+            "page_content",
+            "",
+        )
     ).strip()
 
 
 def doc_to_source(
     doc: Any,
 ) -> str:
+
     metadata = getattr(
         doc,
         "metadata",
         {},
-    )
+    ) or {}
 
     return str(
         metadata.get(
@@ -227,33 +279,27 @@ def doc_to_source(
 def doc_to_page(
     doc: Any,
 ) -> str:
+
     metadata = getattr(
         doc,
         "metadata",
         {},
-    )
+    ) or {}
 
-    page = metadata.get(
-        "page_number",
+    return str(
         metadata.get(
-            "page",
-            "Unknown",
-        ),
+            "page_number",
+            metadata.get(
+                "page",
+                "Unknown",
+            ),
+        )
     )
 
-    return str(page)
 
-
-def empty_metric_fields() -> dict[str, str]:
-    return {
-        metric: ""
-        for metric in REQUESTED_METRIC_ORDER
-    }
-
-
-# ---------------------------------------------------------------------------
-# Per-question execution
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Per-question evaluation
+# ============================================================================
 
 def run_sample(
     question: str,
@@ -261,49 +307,79 @@ def run_sample(
     model_name: str,
 ) -> dict[str, str]:
 
-    base_row = {
+    row = {
         "question": question,
         "ground_truth": ground_truth,
         "answer": "",
+
         "retrieved_contexts": json.dumps(
             [],
             ensure_ascii=False,
         ),
+
         "retrieved_sources": json.dumps(
             [],
             ensure_ascii=False,
         ),
+
         "retrieved_pages": json.dumps(
             [],
             ensure_ascii=False,
         ),
+
         "status": "failed",
         "guardrail_reason": "",
+
         "retrieved_count": "0",
         "context_count": "0",
         "memory_count": "0",
-        **empty_metric_fields(),
+
+        # RAGAS
+        "faithfulness": "",
+        "answer_relevancy": "",
+        "context_precision": "",
+        "context_recall": "",
+
+        # Performance
+        "latency_ms": "",
+        "input_tokens": "",
+        "output_tokens": "",
+        "total_tokens": "",
+        "tokens_per_second": "",
     }
 
-    # Every evaluation sample gets a fresh conversation ID.
-    # This prevents accidental conversation-state coupling.
-    evaluation_conversation_id = (
-        f"ragas-{uuid4().hex}"
-    )
+    start_time = time.perf_counter()
 
     try:
-        answer, docs, metadata = ask_question(
-            question=question,
-            model_name=model_name,
-            chat_history=[],
-            user_id=EVAL_USER_ID,
-            conversation_id=(
-                evaluation_conversation_id
-            ),
-            return_metadata=True,
+
+        answer, docs, metadata = (
+            ask_question(
+                question=question,
+                model_name=model_name,
+                chat_history=[],
+                user_id=EVAL_USER_ID,
+                return_metadata=True,
+            )
         )
 
-        status = str(
+        elapsed_seconds = (
+            time.perf_counter()
+            - start_time
+        )
+
+        # ------------------------------------------------------------
+        # Latency
+        # ------------------------------------------------------------
+
+        row["latency_ms"] = (
+            f"{elapsed_seconds * 1000:.3f}"
+        )
+
+        # ------------------------------------------------------------
+        # Basic metadata
+        # ------------------------------------------------------------
+
+        row["status"] = str(
             metadata.get(
                 "status",
                 "answered",
@@ -311,7 +387,7 @@ def run_sample(
             or "answered"
         ).strip()
 
-        guardrail_reason = str(
+        row["guardrail_reason"] = str(
             metadata.get(
                 "guardrail_reason",
                 "",
@@ -319,41 +395,104 @@ def run_sample(
             or ""
         ).strip()
 
-        base_row["status"] = status
-        base_row[
-            "guardrail_reason"
-        ] = guardrail_reason
-
-        base_row["retrieved_count"] = str(
+        row["retrieved_count"] = str(
             metadata.get(
                 "retrieved_count",
                 0,
             )
         )
 
-        base_row["context_count"] = str(
+        row["context_count"] = str(
             metadata.get(
                 "context_count",
                 len(docs),
             )
         )
 
-        base_row["memory_count"] = str(
+        row["memory_count"] = str(
             metadata.get(
                 "memory_count",
                 0,
             )
         )
 
-        if status == "blocked":
-            return base_row
+        # ------------------------------------------------------------
+        # Token usage
+        # ------------------------------------------------------------
+
+        input_tokens = metadata.get(
+            "input_tokens"
+        )
+
+        output_tokens = metadata.get(
+            "output_tokens"
+        )
+
+        total_tokens = metadata.get(
+            "total_tokens"
+        )
+
+        if input_tokens is not None:
+
+            row["input_tokens"] = str(
+                input_tokens
+            )
+
+        if output_tokens is not None:
+
+            row["output_tokens"] = str(
+                output_tokens
+            )
+
+        if total_tokens is not None:
+
+            row["total_tokens"] = str(
+                total_tokens
+            )
+
+        if (
+            output_tokens is not None
+            and elapsed_seconds > 0
+        ):
+
+            row[
+                "tokens_per_second"
+            ] = f"{
+                float(output_tokens)
+                / elapsed_seconds
+            :.3f}"
+
+        # ------------------------------------------------------------
+        # Guardrail blocked
+        # ------------------------------------------------------------
+
+        if row["status"] == "blocked":
+
+            return row
+
+        # ------------------------------------------------------------
+        # Answer
+        # ------------------------------------------------------------
+
+        row["answer"] = str(
+            answer or ""
+        ).strip()
+
+        # ------------------------------------------------------------
+        # Retrieved contexts
+        # ------------------------------------------------------------
 
         contexts = []
         sources = []
         pages = []
 
         for doc in docs:
-            context = doc_to_context(doc)
+
+            context = (
+                doc_to_context(
+                    doc
+                )
+            )
 
             if not context:
                 continue
@@ -363,74 +502,87 @@ def run_sample(
             )
 
             sources.append(
-                doc_to_source(doc)
+                doc_to_source(
+                    doc
+                )
             )
 
             pages.append(
-                doc_to_page(doc)
+                doc_to_page(
+                    doc
+                )
             )
 
-        base_row["answer"] = str(
-            answer or ""
-        ).strip()
-
-        base_row[
+        row[
             "retrieved_contexts"
         ] = json.dumps(
             contexts,
             ensure_ascii=False,
         )
 
-        base_row[
+        row[
             "retrieved_sources"
         ] = json.dumps(
             sources,
             ensure_ascii=False,
         )
 
-        base_row[
+        row[
             "retrieved_pages"
         ] = json.dumps(
             pages,
             ensure_ascii=False,
         )
 
-        base_row["status"] = "answered"
+        row["status"] = "answered"
 
-        return base_row
+        return row
 
     except Exception:
+
+        elapsed_seconds = (
+            time.perf_counter()
+            - start_time
+        )
+
+        row["latency_ms"] = (
+            f"{elapsed_seconds * 1000:.3f}"
+        )
+
         LOGGER.exception(
             "Evaluation sample failed: %s",
             question,
         )
 
-        return base_row
+        return row
 
 
-# ---------------------------------------------------------------------------
-# Serialization
-# ---------------------------------------------------------------------------
+# ============================================================================
+# RAGAS records
+# ============================================================================
 
 def parse_contexts(
     value: str,
 ) -> list[str]:
+
     if not value:
         return []
 
     try:
-        parsed = json.loads(value)
+
+        parsed = json.loads(
+            value
+        )
 
     except json.JSONDecodeError:
-        LOGGER.warning(
-            "Could not parse retrieved_contexts JSON."
-        )
+
         return []
 
     if not isinstance(
         parsed,
         list,
     ):
+
         return []
 
     return [
@@ -440,38 +592,44 @@ def parse_contexts(
     ]
 
 
-# ---------------------------------------------------------------------------
-# RAGAS dataset
-# ---------------------------------------------------------------------------
-
 def build_ragas_records(
     rows: list[dict[str, str]],
 ) -> tuple[
     list[dict[str, Any]],
     list[int],
 ]:
-    records: list[
-        dict[str, Any]
-    ] = []
 
-    answered_indexes: list[int] = []
+    records = []
+    answered_indexes = []
 
-    for index, row in enumerate(rows):
-        if row.get("status") != "answered":
+    for index, row in enumerate(
+        rows
+    ):
+
+        if row.get(
+            "status"
+        ) != "answered":
+
             continue
 
         question = (
-            row.get("question")
+            row.get(
+                "question"
+            )
             or ""
         ).strip()
 
         answer = (
-            row.get("answer")
+            row.get(
+                "answer"
+            )
             or ""
         ).strip()
 
         ground_truth = (
-            row.get("ground_truth")
+            row.get(
+                "ground_truth"
+            )
             or ""
         ).strip()
 
@@ -483,24 +641,10 @@ def build_ragas_records(
         )
 
         if not question:
-            LOGGER.warning(
-                "Skipping row %d: empty question.",
-                index,
-            )
             continue
 
         if not answer:
-            LOGGER.warning(
-                "Skipping row %d: empty answer.",
-                index,
-            )
             continue
-
-        if not contexts:
-            LOGGER.warning(
-                "Row %d has no retrieved contexts.",
-                index,
-            )
 
         records.append(
             {
@@ -509,7 +653,7 @@ def build_ragas_records(
                 "response": answer,
                 "reference": ground_truth,
 
-                # Compatibility aliases.
+                # Compatibility
                 "question": question,
                 "contexts": contexts,
                 "answer": answer,
@@ -527,11 +671,12 @@ def build_ragas_records(
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # RAGAS
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def build_metrics():
+
     from ragas.metrics import (
         ContextPrecision,
         Faithfulness,
@@ -551,36 +696,19 @@ def run_ragas(
     records: list[dict[str, Any]],
     evaluator_model: str,
 ):
-    try:
-        from datasets import Dataset
-        from ragas import evaluate
-        from ragas.llms import (
-            LangchainLLMWrapper,
-        )
-        from ragas.run_config import (
-            RunConfig,
-        )
 
-    except ImportError as exc:
-        raise ImportError(
-            "Missing RAGAS evaluation dependencies. "
-            "Install ragas and datasets."
-        ) from exc
+    from datasets import Dataset
+    from ragas import evaluate
+    from ragas.llms import (
+        LangchainLLMWrapper,
+    )
+    from ragas.run_config import (
+        RunConfig,
+    )
 
     dataset = Dataset.from_list(
         records
     )
-
-    print("=" * 80)
-    print("FIRST RECORD SENT TO RAGAS")
-    print(
-        json.dumps(
-            records[0],
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
-    print("=" * 80)
 
     evaluator_llm = (
         LangchainLLMWrapper(
@@ -616,22 +744,27 @@ def run_ragas(
     )
 
 
-# ---------------------------------------------------------------------------
-# RAGAS results
-# ---------------------------------------------------------------------------
+# ============================================================================
+# RAGAS result extraction
+# ============================================================================
 
 def normalize_metric_value(
     value: Any,
 ) -> float | None:
+
     if isinstance(
         value,
         (int, float),
     ):
-        numeric = float(value)
+
+        numeric = float(
+            value
+        )
 
         if not math.isnan(
             numeric
         ):
+
             return numeric
 
     return None
@@ -640,6 +773,7 @@ def normalize_metric_value(
 def extract_score_rows(
     result: Any,
 ) -> list[dict[str, Any]]:
+
     scores = getattr(
         result,
         "scores",
@@ -650,6 +784,7 @@ def extract_score_rows(
         scores,
         list,
     ):
+
         return [
             row
             for row in scores
@@ -668,6 +803,7 @@ def extract_score_rows(
     if callable(
         to_pandas
     ):
+
         dataframe = (
             to_pandas()
         )
@@ -684,9 +820,16 @@ def merge_ragas_scores(
     answered_indexes: list[int],
     score_rows: list[dict[str, Any]],
 ) -> None:
+
     for row in rows:
-        for metric in REQUESTED_METRIC_ORDER:
-            row[metric] = row.get(
+
+        for metric in (
+            RAGAS_METRICS
+        ):
+
+            row[
+                metric
+            ] = row.get(
                 metric,
                 "",
             )
@@ -695,12 +838,16 @@ def merge_ragas_scores(
         answered_indexes,
         score_rows,
     ):
+
         target_row = rows[
             row_index
         ]
 
-        for metric in REQUESTED_METRIC_ORDER:
-            metric_value = (
+        for metric in (
+            RAGAS_METRICS
+        ):
+
+            value = (
                 normalize_metric_value(
                     score_row.get(
                         metric
@@ -708,99 +855,300 @@ def merge_ragas_scores(
                 )
             )
 
-            target_row[metric] = (
+            target_row[
+                metric
+            ] = (
                 ""
-                if metric_value is None
-                else f"{metric_value:.6f}"
+                if value is None
+                else f"{value:.6f}"
             )
 
 
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Numeric helpers
+# ============================================================================
 
-def compute_metric_averages(
+def numeric_values(
+    rows: list[dict[str, str]],
+    field: str,
+) -> list[float]:
+
+    values = []
+
+    for row in rows:
+
+        value = row.get(
+            field,
+            "",
+        )
+
+        if value in (
+            "",
+            None,
+        ):
+            continue
+
+        try:
+
+            number = float(
+                value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            continue
+
+        if not math.isnan(
+            number
+        ):
+
+            values.append(
+                number
+            )
+
+    return values
+
+
+def percentile(
+    values: list[float],
+    percentile_value: float,
+) -> float:
+
+    if not values:
+        return float("nan")
+
+    values = sorted(
+        values
+    )
+
+    if len(values) == 1:
+        return values[0]
+
+    position = (
+        (percentile_value / 100)
+        * (len(values) - 1)
+    )
+
+    lower = math.floor(
+        position
+    )
+
+    upper = math.ceil(
+        position
+    )
+
+    if lower == upper:
+        return values[
+            lower
+        ]
+
+    weight = (
+        position - lower
+    )
+
+    return (
+        values[lower]
+        + (
+            values[upper]
+            - values[lower]
+        )
+        * weight
+    )
+
+
+# ============================================================================
+# Aggregation
+# ============================================================================
+
+def compute_ragas_averages(
     rows: list[dict[str, str]],
 ) -> dict[str, float]:
-    averages: dict[
-        str,
-        float,
-    ] = {}
 
-    for metric in REQUESTED_METRIC_ORDER:
-        values: list[float] = []
+    result = {}
 
-        for row in rows:
-            raw_value = row.get(
-                metric,
-                "",
+    for metric in (
+        RAGAS_METRICS
+    ):
+
+        values = numeric_values(
+            rows,
+            metric,
+        )
+
+        result[
+            metric
+        ] = (
+            statistics.mean(
+                values
             )
-
-            if raw_value in (
-                "",
-                None,
-            ):
-                continue
-
-            try:
-                numeric = float(
-                    raw_value
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
-
-            if not math.isnan(
-                numeric
-            ):
-                values.append(
-                    numeric
-                )
-
-        averages[metric] = (
-            sum(values)
-            / len(values)
             if values
             else float("nan")
         )
 
-    return averages
+    return result
 
 
-# ---------------------------------------------------------------------------
+def compute_performance(
+    rows: list[dict[str, str]],
+) -> dict[str, float]:
+
+    latency = numeric_values(
+        rows,
+        "latency_ms",
+    )
+
+    input_tokens = numeric_values(
+        rows,
+        "input_tokens",
+    )
+
+    output_tokens = numeric_values(
+        rows,
+        "output_tokens",
+    )
+
+    total_tokens = numeric_values(
+        rows,
+        "total_tokens",
+    )
+
+    tokens_per_second = numeric_values(
+        rows,
+        "tokens_per_second",
+    )
+
+    total = len(
+        rows
+    )
+
+    answered = sum(
+        1
+        for row in rows
+        if row.get(
+            "status"
+        ) == "answered"
+    )
+
+    failed = sum(
+        1
+        for row in rows
+        if row.get(
+            "status"
+        ) == "failed"
+    )
+
+    return {
+        "average_latency_ms": (
+            statistics.mean(
+                latency
+            )
+            if latency
+            else float("nan")
+        ),
+
+        "p50_latency_ms": percentile(
+            latency,
+            50,
+        ),
+
+        "p95_latency_ms": percentile(
+            latency,
+            95,
+        ),
+
+        "p99_latency_ms": percentile(
+            latency,
+            99,
+        ),
+
+        "average_input_tokens": (
+            statistics.mean(
+                input_tokens
+            )
+            if input_tokens
+            else float("nan")
+        ),
+
+        "average_output_tokens": (
+            statistics.mean(
+                output_tokens
+            )
+            if output_tokens
+            else float("nan")
+        ),
+
+        "average_total_tokens": (
+            statistics.mean(
+                total_tokens
+            )
+            if total_tokens
+            else float("nan")
+        ),
+
+        "average_tokens_per_second": (
+            statistics.mean(
+                tokens_per_second
+            )
+            if tokens_per_second
+            else float("nan")
+        ),
+
+        "success_rate": (
+            answered / total
+            if total
+            else float("nan")
+        ),
+
+        "error_rate": (
+            failed / total
+            if total
+            else float("nan")
+        ),
+    }
+
+
+# ============================================================================
 # Output
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def save_results(
     path: Path,
     rows: list[dict[str, str]],
 ) -> None:
+
     with path.open(
         "w",
         encoding="utf-8",
         newline="",
     ) as csv_file:
+
         writer = csv.DictWriter(
             csv_file,
             fieldnames=RESULT_COLUMNS,
         )
 
         writer.writeheader()
-        writer.writerows(rows)
+
+        writer.writerows(
+            rows
+        )
 
 
 def save_summary(
     path: Path,
-    averages: dict[str, float],
+    ragas_metrics: dict[str, float],
+    performance_metrics: dict[str, float],
 ) -> None:
+
     with path.open(
         "w",
         encoding="utf-8",
         newline="",
     ) as csv_file:
+
         writer = csv.DictWriter(
             csv_file,
             fieldnames=[
@@ -811,10 +1159,39 @@ def save_summary(
 
         writer.writeheader()
 
-        for metric in REQUESTED_METRIC_ORDER:
-            value = averages.get(
-                metric,
-                float("nan"),
+        for metric in (
+            RAGAS_METRICS
+        ):
+
+            value = (
+                ragas_metrics.get(
+                    metric,
+                    float("nan"),
+                )
+            )
+
+            writer.writerow(
+                {
+                    "metric": metric,
+                    "score": (
+                        ""
+                        if math.isnan(
+                            value
+                        )
+                        else f"{value:.6f}"
+                    ),
+                }
+            )
+
+        for metric in (
+            PERFORMANCE_METRICS
+        ):
+
+            value = (
+                performance_metrics.get(
+                    metric,
+                    float("nan"),
+                )
             )
 
             writer.writerow(
@@ -831,57 +1208,64 @@ def save_summary(
             )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Counts
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def summarize_counts(
     rows: list[dict[str, str]],
 ) -> dict[str, int]:
+
     return {
-        "total": len(rows),
+        "total": len(
+            rows
+        ),
+
         "answered": sum(
             1
             for row in rows
             if row.get(
                 "status"
-            )
-            == "answered"
+            ) == "answered"
         ),
+
         "blocked": sum(
             1
             for row in rows
             if row.get(
                 "status"
-            )
-            == "blocked"
+            ) == "blocked"
         ),
+
         "failed": sum(
             1
             for row in rows
             if row.get(
                 "status"
-            )
-            == "failed"
+            ) == "failed"
         ),
     }
 
 
-def format_summary_value(
+def format_value(
     value: float,
 ) -> str:
-    return (
-        "N/A"
-        if math.isnan(value)
-        else f"{value:.6f}"
-    )
+
+    if math.isnan(
+        value
+    ):
+
+        return "N/A"
+
+    return f"{value:.6f}"
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Main
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def main() -> None:
+
     setup_logging()
 
     args = parse_args()
@@ -890,46 +1274,44 @@ def main() -> None:
         args.input
     )
 
-    results_output_path = Path(
+    results_path = Path(
         args.results_output
     )
 
-    summary_output_path = Path(
+    summary_path = Path(
         args.summary_output
     )
 
-    dataset_rows = load_eval_rows(
+    rows = load_eval_rows(
         input_path
     )
 
     if args.limit > 0:
-        dataset_rows = dataset_rows[
-            : args.limit
+
+        rows = rows[
+            :args.limit
         ]
 
     LOGGER.info(
         "Loaded %d evaluation questions from %s",
-        len(dataset_rows),
+        len(rows),
         input_path,
     )
 
-    results: list[
-        dict[str, str]
-    ] = []
+    results = []
 
     total = len(
-        dataset_rows
+        rows
     )
 
+    # ------------------------------------------------------------------
+    # Run chatbot
+    # ------------------------------------------------------------------
+
     for index, row in enumerate(
-        dataset_rows,
+        rows,
         start=1,
     ):
-        LOGGER.info(
-            "Answering sample %d/%d",
-            index,
-            total,
-        )
 
         print(
             f"[{index}/{total}] "
@@ -948,6 +1330,10 @@ def main() -> None:
             )
         )
 
+    # ------------------------------------------------------------------
+    # RAGAS
+    # ------------------------------------------------------------------
+
     records, answered_indexes = (
         build_ragas_records(
             results
@@ -960,20 +1346,35 @@ def main() -> None:
     )
 
     if records:
+
         try:
-            result = run_ragas(
-                records,
-                args.model,
+
+            ragas_result = (
+                run_ragas(
+                    records,
+                    args.model,
+                )
             )
 
-            print("=" * 80)
-            print("RAGAS RESULT")
-            print(result)
-            print("=" * 80)
+            print(
+                "=" * 80
+            )
+
+            print(
+                "RAGAS RESULT"
+            )
+
+            print(
+                ragas_result
+            )
+
+            print(
+                "=" * 80
+            )
 
             score_rows = (
                 extract_score_rows(
-                    result
+                    ragas_result
                 )
             )
 
@@ -983,9 +1384,11 @@ def main() -> None:
             )
 
             if score_rows:
+
                 print(
                     "First score row:"
                 )
+
                 print(
                     score_rows[0]
                 )
@@ -996,90 +1399,181 @@ def main() -> None:
                 score_rows,
             )
 
-            if len(score_rows) != len(
-                answered_indexes
-            ):
-                LOGGER.warning(
-                    "RAGAS returned %d score rows "
-                    "for %d answered rows.",
-                    len(score_rows),
-                    len(answered_indexes),
-                )
-
         except Exception:
+
             LOGGER.exception(
                 "RAGAS evaluation failed."
             )
 
-    else:
-        LOGGER.warning(
-            "No answered rows available for RAGAS."
-        )
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
 
-    averages = (
-        compute_metric_averages(
+    ragas_metrics = (
+        compute_ragas_averages(
             results
         )
     )
 
-    save_results(
-        results_output_path,
-        results,
-    )
-
-    save_summary(
-        summary_output_path,
-        averages,
+    performance_metrics = (
+        compute_performance(
+            results
+        )
     )
 
     counts = summarize_counts(
         results
     )
 
-    LOGGER.info(
-        "Saved evaluation results to %s",
-        results_output_path,
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+
+    save_results(
+        results_path,
+        results,
     )
 
-    LOGGER.info(
-        "Saved RAGAS summary to %s",
-        summary_output_path,
+    save_summary(
+        summary_path,
+        ragas_metrics,
+        performance_metrics,
+    )
+
+    # ------------------------------------------------------------------
+    # Print
+    # ------------------------------------------------------------------
+
+    print()
+    print(
+        "=" * 80
     )
 
     print(
-        f"Total questions: {counts['total']}"
+        "EVALUATION SUMMARY"
     )
 
     print(
-        f"Answered: {counts['answered']}"
+        "=" * 80
     )
 
     print(
-        f"Blocked: {counts['blocked']}"
+        f"Model: {args.model}"
     )
 
     print(
-        f"Failed: {counts['failed']}"
+        f"Total questions: "
+        f"{counts['total']}"
     )
 
     print(
-        "Average Faithfulness: "
-        f"{format_summary_value(averages['faithfulness'])}"
+        f"Answered: "
+        f"{counts['answered']}"
     )
 
     print(
-        "Average Answer Relevancy: "
-        f"{format_summary_value(averages['answer_relevancy'])}"
+        f"Blocked: "
+        f"{counts['blocked']}"
     )
 
     print(
-        "Average Context Precision: "
-        f"{format_summary_value(averages['context_precision'])}"
+        f"Failed: "
+        f"{counts['failed']}"
+    )
+
+    print()
+    print(
+        "RAGAS QUALITY"
     )
 
     print(
-        "Average Context Recall: "
-        f"{format_summary_value(averages['context_recall'])}"
+        f"Average Faithfulness: "
+        f"{format_value(ragas_metrics['faithfulness'])}"
+    )
+
+    print(
+        f"Average Answer Relevancy: "
+        f"{format_value(ragas_metrics['answer_relevancy'])}"
+    )
+
+    print(
+        f"Average Context Precision: "
+        f"{format_value(ragas_metrics['context_precision'])}"
+    )
+
+    print(
+        f"Average Context Recall: "
+        f"{format_value(ragas_metrics['context_recall'])}"
+    )
+
+    print()
+    print(
+        "PERFORMANCE"
+    )
+
+    print(
+        f"Average Latency: "
+        f"{format_value(performance_metrics['average_latency_ms'])} ms"
+    )
+
+    print(
+        f"P50 Latency: "
+        f"{format_value(performance_metrics['p50_latency_ms'])} ms"
+    )
+
+    print(
+        f"P95 Latency: "
+        f"{format_value(performance_metrics['p95_latency_ms'])} ms"
+    )
+
+    print(
+        f"P99 Latency: "
+        f"{format_value(performance_metrics['p99_latency_ms'])} ms"
+    )
+
+    print(
+        f"Average Input Tokens: "
+        f"{format_value(performance_metrics['average_input_tokens'])}"
+    )
+
+    print(
+        f"Average Output Tokens: "
+        f"{format_value(performance_metrics['average_output_tokens'])}"
+    )
+
+    print(
+        f"Average Total Tokens: "
+        f"{format_value(performance_metrics['average_total_tokens'])}"
+    )
+
+    print(
+        f"Average Tokens/sec: "
+        f"{format_value(performance_metrics['average_tokens_per_second'])}"
+    )
+
+    print(
+        f"Success Rate: "
+        f"{format_value(performance_metrics['success_rate'])}"
+    )
+
+    print(
+        f"Error Rate: "
+        f"{format_value(performance_metrics['error_rate'])}"
+    )
+
+    print()
+    print(
+        f"Saved results to: "
+        f"{results_path}"
+    )
+
+    print(
+        f"Saved summary to: "
+        f"{summary_path}"
+    )
+
+    print(
+        "=" * 80
     )
 
 

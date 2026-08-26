@@ -537,6 +537,60 @@ def format_ask_result(
 # ---------------------------------------------------------------------------
 # Main RAG operation
 # ---------------------------------------------------------------------------
+def extract_usage_metadata(
+    response: Any,
+) -> dict[str, Any]:
+    usage: dict[str, Any] = {}
+
+    usage_metadata = getattr(
+        response,
+        "usage_metadata",
+        None,
+    )
+
+    if isinstance(usage_metadata, dict):
+        usage.update(usage_metadata)
+
+    response_metadata = getattr(
+        response,
+        "response_metadata",
+        None,
+    )
+
+    if isinstance(response_metadata, dict):
+
+        model_name = (
+            response_metadata.get("model_name")
+            or response_metadata.get("model")
+        )
+
+        if model_name:
+            usage["model_name"] = model_name
+
+        token_usage = response_metadata.get(
+            "token_usage"
+        )
+
+        if isinstance(token_usage, dict):
+
+            usage.setdefault(
+                "input_tokens",
+                token_usage.get("prompt_tokens"),
+            )
+
+            usage.setdefault(
+                "output_tokens",
+                token_usage.get("completion_tokens"),
+            )
+
+            usage.setdefault(
+                "total_tokens",
+                token_usage.get("total_tokens"),
+            )
+
+    return usage
+
+
 
 def ask_question(
     question: str,
@@ -547,12 +601,18 @@ def ask_question(
     return_metadata: bool = False,
 ):
     metadata: dict[str, Any] = {
-        "status": "answered",
-        "guardrail_reason": "",
-        "retrieved_count": 0,
-        "context_count": 0,
-        "memory_count": 0,
-    }
+    "status": "answered",
+    "guardrail_reason": "",
+    "retrieved_count": 0,
+    "context_count": 0,
+    "memory_count": 0,
+
+    # LLM evaluation / observability
+    "model_name": model_name,
+    "input_tokens": None,
+    "output_tokens": None,
+    "total_tokens": None,
+}
 
     if chat_history is None:
         chat_history = []
@@ -759,6 +819,29 @@ def ask_question(
             effective_conversation_id,
         )
         raise
+
+
+    usage_metadata = extract_usage_metadata(
+        response
+    )
+
+    metadata["model_name"] = (
+        usage_metadata.get("model_name")
+        or model_name
+    )
+
+    metadata["input_tokens"] = (
+        usage_metadata.get("input_tokens")
+    )
+
+    metadata["output_tokens"] = (
+        usage_metadata.get("output_tokens")
+    )
+
+    metadata["total_tokens"] = (
+        usage_metadata.get("total_tokens")
+    )
+
 
     answer = str(
         getattr(
