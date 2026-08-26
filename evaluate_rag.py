@@ -455,12 +455,9 @@ def run_sample(
             and elapsed_seconds > 0
         ):
 
-            row[
-                "tokens_per_second"
-            ] = f"{
-                float(output_tokens)
-                / elapsed_seconds
-            :.3f}"
+            row["tokens_per_second"] = (
+    f"{float(output_tokens) / elapsed_seconds:.3f}"
+)
 
         # ------------------------------------------------------------
         # Guardrail blocked
