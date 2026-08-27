@@ -14,9 +14,11 @@ from chatbot.chain import (
     ask_question,
     get_llm,
 )
+
 from chatbot.retriever import (
     get_embedding_model,
 )
+
 from config import DEFAULT_MODEL
 
 
@@ -43,6 +45,10 @@ DEFAULT_SUMMARY_PATH = (
 
 EVAL_USER_ID = "ragas_test"
 
+# Fixed RAGAS evaluator.
+# This stays the same when benchmarking Mistral or OxAlpha.
+RAGAS_EVALUATOR_MODEL = "mistral-small-latest"
+
 
 RAGAS_METRICS = [
     "faithfulness",
@@ -57,6 +63,26 @@ PERFORMANCE_METRICS = [
     "p50_latency_ms",
     "p95_latency_ms",
     "p99_latency_ms",
+    "average_retrieval_latency_ms",
+    "p50_retrieval_latency_ms",
+    "p95_retrieval_latency_ms",
+    "p99_retrieval_latency_ms",
+    "average_context_expansion_latency_ms",
+    "p50_context_expansion_latency_ms",
+    "p95_context_expansion_latency_ms",
+    "p99_context_expansion_latency_ms",
+    "average_memory_retrieval_latency_ms",
+    "p50_memory_retrieval_latency_ms",
+    "p95_memory_retrieval_latency_ms",
+    "p99_memory_retrieval_latency_ms",
+    "average_llm_latency_ms",
+    "p50_llm_latency_ms",
+    "p95_llm_latency_ms",
+    "p99_llm_latency_ms",
+    "average_memory_write_latency_ms",
+    "p50_memory_write_latency_ms",
+    "p95_memory_write_latency_ms",
+    "p99_memory_write_latency_ms",
     "average_input_tokens",
     "average_output_tokens",
     "average_total_tokens",
@@ -87,6 +113,11 @@ RESULT_COLUMNS = [
 
     # Performance
     "latency_ms",
+    "retrieval_latency_ms",
+    "context_expansion_latency_ms",
+    "memory_retrieval_latency_ms",
+    "llm_latency_ms",
+    "memory_write_latency_ms",
     "input_tokens",
     "output_tokens",
     "total_tokens",
@@ -99,7 +130,6 @@ RESULT_COLUMNS = [
 # ============================================================================
 
 def setup_logging() -> None:
-
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -143,7 +173,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODEL,
         help=(
             "LLM model used by the chatbot "
-            "and RAGAS evaluator."
+            "being benchmarked."
         ),
     )
 
@@ -154,6 +184,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of questions to evaluate. "
             "0 means all."
+        ),
+    )
+
+    parser.add_argument(
+        "--ragas-only",
+        action="store_true",
+        help=(
+            "Run RAGAS only on an existing "
+            "evaluation results CSV. "
+            "Does not call the chatbot."
         ),
     )
 
@@ -169,7 +209,6 @@ def load_eval_rows(
 ) -> list[dict[str, str]]:
 
     if not path.exists():
-
         raise FileNotFoundError(
             f"Evaluation dataset not found: {path}"
         )
@@ -198,7 +237,6 @@ def load_eval_rows(
         )
 
         if missing:
-
             raise ValueError(
                 "Evaluation CSV is missing "
                 f"required columns: "
@@ -239,6 +277,52 @@ def load_eval_rows(
             )
 
         return rows
+
+
+def load_existing_results(
+    path: Path,
+) -> list[dict[str, str]]:
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Existing results file not found: {path}"
+        )
+
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as csv_file:
+
+        reader = csv.DictReader(
+            csv_file
+        )
+
+        rows = []
+
+        for row in reader:
+
+            normalized_row = {
+                key: (
+                    value
+                    if value is not None
+                    else ""
+                )
+                for key, value in row.items()
+            }
+
+            rows.append(
+                normalized_row
+            )
+
+    LOGGER.info(
+        "Loaded %d existing evaluation "
+        "results from %s",
+        len(rows),
+        path,
+    )
+
+    return rows
 
 
 # ============================================================================
@@ -342,6 +426,11 @@ def run_sample(
 
         # Performance
         "latency_ms": "",
+        "retrieval_latency_ms": "",
+        "context_expansion_latency_ms": "",
+        "memory_retrieval_latency_ms": "",
+        "llm_latency_ms": "",
+        "memory_write_latency_ms": "",
         "input_tokens": "",
         "output_tokens": "",
         "total_tokens": "",
@@ -417,6 +506,30 @@ def run_sample(
         )
 
         # ------------------------------------------------------------
+        # Component latency
+        # ------------------------------------------------------------
+
+        latency_fields = [
+            "retrieval_latency_ms",
+            "context_expansion_latency_ms",
+            "memory_retrieval_latency_ms",
+            "llm_latency_ms",
+            "memory_write_latency_ms",
+        ]
+
+        for field in latency_fields:
+
+            value = metadata.get(
+                field
+            )
+
+            if value is not None:
+
+                row[field] = (
+                    f"{float(value):.3f}"
+                )
+
+        # ------------------------------------------------------------
         # Token usage
         # ------------------------------------------------------------
 
@@ -456,8 +569,8 @@ def run_sample(
         ):
 
             row["tokens_per_second"] = (
-    f"{float(output_tokens) / elapsed_seconds:.3f}"
-)
+                f"{float(output_tokens) / elapsed_seconds:.3f}"
+            )
 
         # ------------------------------------------------------------
         # Guardrail blocked
@@ -691,7 +804,6 @@ def build_metrics():
 
 def run_ragas(
     records: list[dict[str, Any]],
-    evaluator_model: str,
 ):
 
     from datasets import Dataset
@@ -707,10 +819,13 @@ def run_ragas(
         records
     )
 
+    # IMPORTANT:
+    # RAGAS always uses the same fixed
+    # evaluator model.
     evaluator_llm = (
         LangchainLLMWrapper(
             get_llm(
-                evaluator_model,
+                RAGAS_EVALUATOR_MODEL,
                 max_tokens=4096,
             )
         )
@@ -720,9 +835,13 @@ def run_ragas(
         get_embedding_model()
     )
 
+    # Lower concurrency to reduce
+    # temporary 503 errors from the
+    # evaluator endpoint.
     run_config = RunConfig(
         timeout=300,
-        max_workers=2,
+        max_workers=1,
+        max_retries=5,
     )
 
     LOGGER.info(
@@ -735,7 +854,7 @@ def run_ragas(
         metrics=build_metrics(),
         llm=evaluator_llm,
         embeddings=evaluator_embeddings,
-        raise_exceptions=True,
+        raise_exceptions=False,
         show_progress=True,
         run_config=run_config,
     )
@@ -938,6 +1057,7 @@ def percentile(
     )
 
     if lower == upper:
+
         return values[
             lower
         ]
@@ -995,6 +1115,31 @@ def compute_performance(
     latency = numeric_values(
         rows,
         "latency_ms",
+    )
+
+    retrieval_latency = numeric_values(
+        rows,
+        "retrieval_latency_ms",
+    )
+
+    context_expansion_latency = numeric_values(
+        rows,
+        "context_expansion_latency_ms",
+    )
+
+    memory_retrieval_latency = numeric_values(
+        rows,
+        "memory_retrieval_latency_ms",
+    )
+
+    llm_latency = numeric_values(
+        rows,
+        "llm_latency_ms",
+    )
+
+    memory_write_latency = numeric_values(
+        rows,
+        "memory_write_latency_ms",
     )
 
     input_tokens = numeric_values(
@@ -1058,6 +1203,121 @@ def compute_performance(
 
         "p99_latency_ms": percentile(
             latency,
+            99,
+        ),
+
+        "average_retrieval_latency_ms": (
+            statistics.mean(
+                retrieval_latency
+            )
+            if retrieval_latency
+            else float("nan")
+        ),
+
+        "p50_retrieval_latency_ms": percentile(
+            retrieval_latency,
+            50,
+        ),
+
+        "p95_retrieval_latency_ms": percentile(
+            retrieval_latency,
+            95,
+        ),
+
+        "p99_retrieval_latency_ms": percentile(
+            retrieval_latency,
+            99,
+        ),
+
+        "average_context_expansion_latency_ms": (
+            statistics.mean(
+                context_expansion_latency
+            )
+            if context_expansion_latency
+            else float("nan")
+        ),
+
+        "p50_context_expansion_latency_ms": percentile(
+            context_expansion_latency,
+            50,
+        ),
+
+        "p95_context_expansion_latency_ms": percentile(
+            context_expansion_latency,
+            95,
+        ),
+
+        "p99_context_expansion_latency_ms": percentile(
+            context_expansion_latency,
+            99,
+        ),
+
+        "average_memory_retrieval_latency_ms": (
+            statistics.mean(
+                memory_retrieval_latency
+            )
+            if memory_retrieval_latency
+            else float("nan")
+        ),
+
+        "p50_memory_retrieval_latency_ms": percentile(
+            memory_retrieval_latency,
+            50,
+        ),
+
+        "p95_memory_retrieval_latency_ms": percentile(
+            memory_retrieval_latency,
+            95,
+        ),
+
+        "p99_memory_retrieval_latency_ms": percentile(
+            memory_retrieval_latency,
+            99,
+        ),
+
+        "average_llm_latency_ms": (
+            statistics.mean(
+                llm_latency
+            )
+            if llm_latency
+            else float("nan")
+        ),
+
+        "p50_llm_latency_ms": percentile(
+            llm_latency,
+            50,
+        ),
+
+        "p95_llm_latency_ms": percentile(
+            llm_latency,
+            95,
+        ),
+
+        "p99_llm_latency_ms": percentile(
+            llm_latency,
+            99,
+        ),
+
+        "average_memory_write_latency_ms": (
+            statistics.mean(
+                memory_write_latency
+            )
+            if memory_write_latency
+            else float("nan")
+        ),
+
+        "p50_memory_write_latency_ms": percentile(
+            memory_write_latency,
+            50,
+        ),
+
+        "p95_memory_write_latency_ms": percentile(
+            memory_write_latency,
+            95,
+        ),
+
+        "p99_memory_write_latency_ms": percentile(
+            memory_write_latency,
             99,
         ),
 
@@ -1279,9 +1539,21 @@ def main() -> None:
         args.summary_output
     )
 
-    rows = load_eval_rows(
-        input_path
-    )
+    # ------------------------------------------------------------------
+    # Load data
+    # ------------------------------------------------------------------
+
+    if args.ragas_only:
+
+        rows = load_existing_results(
+            results_path
+        )
+
+    else:
+
+        rows = load_eval_rows(
+            input_path
+        )
 
     if args.limit > 0:
 
@@ -1290,9 +1562,8 @@ def main() -> None:
         ]
 
     LOGGER.info(
-        "Loaded %d evaluation questions from %s",
+        "Loaded %d evaluation rows.",
         len(rows),
-        input_path,
     )
 
     results = []
@@ -1305,27 +1576,41 @@ def main() -> None:
     # Run chatbot
     # ------------------------------------------------------------------
 
-    for index, row in enumerate(
-        rows,
-        start=1,
-    ):
+    if args.ragas_only:
 
-        print(
-            f"[{index}/{total}] "
-            "Processing question"
+        # IMPORTANT:
+        # Reuse existing chatbot results.
+        # No chatbot calls happen here.
+        results = rows
+
+        LOGGER.info(
+            "RAGAS-only mode enabled. "
+            "Skipping chatbot generation."
         )
 
-        results.append(
-            run_sample(
-                question=row[
-                    "question"
-                ],
-                ground_truth=row[
-                    "ground_truth"
-                ],
-                model_name=args.model,
+    else:
+
+        for index, row in enumerate(
+            rows,
+            start=1,
+        ):
+
+            print(
+                f"[{index}/{total}] "
+                "Processing question"
             )
-        )
+
+            results.append(
+                run_sample(
+                    question=row[
+                        "question"
+                    ],
+                    ground_truth=row[
+                        "ground_truth"
+                    ],
+                    model_name=args.model,
+                )
+            )
 
     # ------------------------------------------------------------------
     # RAGAS
@@ -1349,7 +1634,6 @@ def main() -> None:
             ragas_result = (
                 run_ragas(
                     records,
-                    args.model,
                 )
             )
 
@@ -1426,10 +1710,14 @@ def main() -> None:
     # Save
     # ------------------------------------------------------------------
 
-    save_results(
-        results_path,
-        results,
-    )
+    # Do NOT overwrite the original
+    # chatbot results in RAGAS-only mode.
+    if not args.ragas_only:
+
+        save_results(
+            results_path,
+            results,
+        )
 
     save_summary(
         summary_path,
@@ -1442,6 +1730,7 @@ def main() -> None:
     # ------------------------------------------------------------------
 
     print()
+
     print(
         "=" * 80
     )
@@ -1454,9 +1743,32 @@ def main() -> None:
         "=" * 80
     )
 
-    print(
-        f"Model: {args.model}"
-    )
+    if args.ragas_only:
+
+        print(
+            "Mode: RAGAS-only"
+        )
+
+        print(
+            "Source: "
+            f"{results_path}"
+        )
+
+        print(
+            "Chatbot model: "
+            "x-preview-f-free"
+        )
+
+        print(
+            "RAGAS evaluator: "
+            f"{RAGAS_EVALUATOR_MODEL}"
+        )
+
+    else:
+
+        print(
+            f"Model: {args.model}"
+        )
 
     print(
         f"Total questions: "
@@ -1479,6 +1791,7 @@ def main() -> None:
     )
 
     print()
+
     print(
         "RAGAS QUALITY"
     )
@@ -1504,6 +1817,7 @@ def main() -> None:
     )
 
     print()
+
     print(
         "PERFORMANCE"
     )
@@ -1527,6 +1841,138 @@ def main() -> None:
         f"P99 Latency: "
         f"{format_value(performance_metrics['p99_latency_ms'])} ms"
     )
+
+    print()
+
+    print(
+        "RETRIEVAL LATENCY"
+    )
+
+    print(
+        f"Average Retrieval Latency: "
+        f"{format_value(performance_metrics['average_retrieval_latency_ms'])} ms"
+    )
+
+    print(
+        f"P50 Retrieval Latency: "
+        f"{format_value(performance_metrics['p50_retrieval_latency_ms'])} ms"
+    )
+
+    print(
+        f"P95 Retrieval Latency: "
+        f"{format_value(performance_metrics['p95_retrieval_latency_ms'])} ms"
+    )
+
+    print(
+        f"P99 Retrieval Latency: "
+        f"{format_value(performance_metrics['p99_retrieval_latency_ms'])} ms"
+    )
+
+    print()
+
+    print(
+        "CONTEXT EXPANSION LATENCY"
+    )
+
+    print(
+        f"Average Context Expansion Latency: "
+        f"{format_value(performance_metrics['average_context_expansion_latency_ms'])} ms"
+    )
+
+    print(
+        f"P50 Context Expansion Latency: "
+        f"{format_value(performance_metrics['p50_context_expansion_latency_ms'])} ms"
+    )
+
+    print(
+        f"P95 Context Expansion Latency: "
+        f"{format_value(performance_metrics['p95_context_expansion_latency_ms'])} ms"
+    )
+
+    print(
+        f"P99 Context Expansion Latency: "
+        f"{format_value(performance_metrics['p99_context_expansion_latency_ms'])} ms"
+    )
+
+    print()
+
+    print(
+        "MEMORY RETRIEVAL LATENCY"
+    )
+
+    print(
+        f"Average Memory Retrieval Latency: "
+        f"{format_value(performance_metrics['average_memory_retrieval_latency_ms'])} ms"
+    )
+
+    print(
+        f"P50 Memory Retrieval Latency: "
+        f"{format_value(performance_metrics['p50_memory_retrieval_latency_ms'])} ms"
+    )
+
+    print(
+        f"P95 Memory Retrieval Latency: "
+        f"{format_value(performance_metrics['p95_memory_retrieval_latency_ms'])} ms"
+    )
+
+    print(
+        f"P99 Memory Retrieval Latency: "
+        f"{format_value(performance_metrics['p99_memory_retrieval_latency_ms'])} ms"
+    )
+
+    print()
+
+    print(
+        "LLM LATENCY"
+    )
+
+    print(
+        f"Average LLM Latency: "
+        f"{format_value(performance_metrics['average_llm_latency_ms'])} ms"
+    )
+
+    print(
+        f"P50 LLM Latency: "
+        f"{format_value(performance_metrics['p50_llm_latency_ms'])} ms"
+    )
+
+    print(
+        f"P95 LLM Latency: "
+        f"{format_value(performance_metrics['p95_llm_latency_ms'])} ms"
+    )
+
+    print(
+        f"P99 LLM Latency: "
+        f"{format_value(performance_metrics['p99_llm_latency_ms'])} ms"
+    )
+
+    print()
+
+    print(
+        "MEMORY WRITE LATENCY"
+    )
+
+    print(
+        f"Average Memory Write Latency: "
+        f"{format_value(performance_metrics['average_memory_write_latency_ms'])} ms"
+    )
+
+    print(
+        f"P50 Memory Write Latency: "
+        f"{format_value(performance_metrics['p50_memory_write_latency_ms'])} ms"
+    )
+
+    print(
+        f"P95 Memory Write Latency: "
+        f"{format_value(performance_metrics['p95_memory_write_latency_ms'])} ms"
+    )
+
+    print(
+        f"P99 Memory Write Latency: "
+        f"{format_value(performance_metrics['p99_memory_write_latency_ms'])} ms"
+    )
+
+    print()
 
     print(
         f"Average Input Tokens: "
@@ -1559,10 +2005,20 @@ def main() -> None:
     )
 
     print()
-    print(
-        f"Saved results to: "
-        f"{results_path}"
-    )
+
+    if args.ragas_only:
+
+        print(
+            "Original evaluation_results.csv "
+            "was NOT overwritten."
+        )
+
+    else:
+
+        print(
+            f"Saved results to: "
+            f"{results_path}"
+        )
 
     print(
         f"Saved summary to: "

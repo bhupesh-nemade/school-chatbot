@@ -133,24 +133,59 @@ LLM_MAX_RETRIES = _get_int(
     minimum=0,
 )
 
+
+# ----------------------------------------------------------------------------
+# Mistral
+# ----------------------------------------------------------------------------
+
 MISTRAL_API_KEY = os.getenv(
     "MISTRAL_API_KEY"
-)
-
-OPENROUTER_API_KEY = os.getenv(
-    "OPENROUTER_API_KEY"
-)
-
-HF_API_KEY = os.getenv(
-    "HF_API_KEY"
 )
 
 MISTRAL_BASE_URL = (
     "https://api.mistral.ai/v1"
 )
 
+
+# ----------------------------------------------------------------------------
+# OxAlpha / OpenCode Zen
+# ----------------------------------------------------------------------------
+
+OXALPHA_API_KEY = os.getenv(
+    "OXALPHA_API_KEY",
+    ""
+).strip()
+
+OXALPHA_BASE_URL = os.getenv(
+    "OXALPHA_BASE_URL",
+    "https://opencode.ai/zen/v1",
+).strip()
+
+OXALPHA_MODEL = os.getenv(
+    "OXALPHA_MODEL",
+    "x-preview-f-free",
+).strip()
+
+
+# ----------------------------------------------------------------------------
+# OpenRouter
+# ----------------------------------------------------------------------------
+
+OPENROUTER_API_KEY = os.getenv(
+    "OPENROUTER_API_KEY"
+)
+
 OPENROUTER_BASE_URL = (
     "https://openrouter.ai/api/v1"
+)
+
+
+# ----------------------------------------------------------------------------
+# Hugging Face
+# ----------------------------------------------------------------------------
+
+HF_API_KEY = os.getenv(
+    "HF_API_KEY"
 )
 
 HF_BASE_URL = (
@@ -170,13 +205,6 @@ PINECONE_INDEX_NAME = os.getenv(
     "PINECONE_INDEX_NAME"
 )
 
-# ---------------------------------------------------------------------------
-# Versioned vector namespace
-#
-# The existing empty namespace contains the old 2,160-vector corpus.
-# The new production corpus will be written to this separate namespace.
-# ---------------------------------------------------------------------------
-
 PINECONE_NAMESPACE = (
     os.getenv(
         "PINECONE_NAMESPACE",
@@ -185,8 +213,6 @@ PINECONE_NAMESPACE = (
     .strip()
 )
 
-# Explicit version identifiers allow us to know exactly how the index
-# was produced.
 INDEX_VERSION = (
     os.getenv(
         "INDEX_VERSION",
@@ -260,7 +286,9 @@ RAG_MIN_RELEVANCE_SCORE = _get_float(
     0.0,
 )
 
-# Context limits.
+
+# Context limits
+
 RAG_MAX_INITIAL_DOCS = _get_int(
     "RAG_MAX_INITIAL_DOCS",
     12,
@@ -366,12 +394,21 @@ def validate_env() -> None:
         )
 
     if LLM_PROVIDER == "mistral":
+
         if not MISTRAL_API_KEY:
             missing.append(
                 "MISTRAL_API_KEY"
             )
 
+    elif LLM_PROVIDER == "oxalpha":
+
+        if not OXALPHA_API_KEY:
+            missing.append(
+                "OXALPHA_API_KEY"
+            )
+
     elif LLM_PROVIDER == "openrouter":
+
         if not OPENROUTER_API_KEY:
             missing.append(
                 "OPENROUTER_API_KEY"
@@ -381,15 +418,17 @@ def validate_env() -> None:
         "huggingface",
         "hf",
     }:
+
         if not HF_API_KEY:
             missing.append(
                 "HF_API_KEY"
             )
 
     else:
+
         raise ValueError(
             "Unsupported LLM_PROVIDER. "
-            "Use: mistral, openrouter, or huggingface."
+            "Use: mistral, oxalpha, openrouter, or huggingface."
         )
 
     if missing:
@@ -402,6 +441,7 @@ def validate_env() -> None:
 
 
 def validate_runtime_config() -> None:
+
     if not DEFAULT_MODEL:
         raise ValueError(
             "DEFAULT_MODEL cannot be empty."

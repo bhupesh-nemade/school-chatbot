@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,9 +30,10 @@ from config import (
     LLM_TIMEOUT_SECONDS,
     MAX_CHAT_HISTORY_TURNS,
     MISTRAL_API_KEY,
-    MISTRAL_BASE_URL,
-    OPENROUTER_API_KEY,
-    OPENROUTER_BASE_URL,
+MISTRAL_BASE_URL,
+OXALPHA_API_KEY,
+OXALPHA_BASE_URL,
+OXALPHA_MODEL,
     RAG_MAX_CONTEXT_CHARS,
     RAG_MAX_CONTEXT_DOCS,
     RAG_MAX_INITIAL_DOCS,
@@ -97,23 +99,34 @@ def get_llm(
     if not model_name:
         raise ValueError("model_name is required.")
 
-    if LLM_PROVIDER == "mistral":
+    # if LLM_PROVIDER == "mistral":
+    #     api_key = MISTRAL_API_KEY
+    #     base_url = MISTRAL_BASE_URL
+
+    # elif LLM_PROVIDER == "openrouter":
+    #     api_key = OPENROUTER_API_KEY
+    #     base_url = OPENROUTER_BASE_URL
+
+    # elif LLM_PROVIDER in {"huggingface", "hf"}:
+    #     api_key = HF_API_KEY
+    #     base_url = HF_BASE_URL
+
+    # else:
+    #     raise ValueError(
+    #         f"Unsupported LLM provider: {LLM_PROVIDER}"
+    #     )
+    if model_name == OXALPHA_MODEL:
+        api_key = OXALPHA_API_KEY
+        base_url = OXALPHA_BASE_URL
+
+    elif LLM_PROVIDER == "mistral":
         api_key = MISTRAL_API_KEY
         base_url = MISTRAL_BASE_URL
-
-    elif LLM_PROVIDER == "openrouter":
-        api_key = OPENROUTER_API_KEY
-        base_url = OPENROUTER_BASE_URL
-
-    elif LLM_PROVIDER in {"huggingface", "hf"}:
-        api_key = HF_API_KEY
-        base_url = HF_BASE_URL
 
     else:
         raise ValueError(
             f"Unsupported LLM provider: {LLM_PROVIDER}"
         )
-
     if not api_key:
         raise RuntimeError(
             f"API key missing for provider '{LLM_PROVIDER}'."
@@ -607,6 +620,13 @@ def ask_question(
     "context_count": 0,
     "memory_count": 0,
 
+    # Component latency / observability
+    "retrieval_latency_ms": None,
+    "context_expansion_latency_ms": None,
+    "memory_retrieval_latency_ms": None,
+    "llm_latency_ms": None,
+    "memory_write_latency_ms": None,
+
     # LLM evaluation / observability
     "model_name": model_name,
     "input_tokens": None,
@@ -681,9 +701,10 @@ def ask_question(
     # ------------------------------------------------------------------
     # 4. Primary retrieval
     # ------------------------------------------------------------------
-
     vectorstore = get_vectorstore()
     retriever = get_retriever()
+
+    retrieval_start = time.perf_counter()
 
     try:
         retrieved_docs = retriever.invoke(
@@ -698,6 +719,15 @@ def ask_question(
             effective_conversation_id,
         )
         raise
+
+    retrieval_latency_ms = (
+        time.perf_counter()
+        - retrieval_start
+    ) * 1000
+
+    metadata["retrieval_latency_ms"] = (
+        retrieval_latency_ms
+    )
 
     retrieved_docs = deduplicate_docs(
         limit_docs(
@@ -723,14 +753,21 @@ def ask_question(
 
  
 
+    context_expansion_start = time.perf_counter()
+
     if effective_user_id == "ragas_test":
         context_docs = retrieved_docs
     else:
         context_docs = expand_context_docs(
-        vectorstore=vectorstore,
-        query=rewritten_question,
-        docs=retrieved_docs,
-    )
+            vectorstore=vectorstore,
+            query=rewritten_question,
+            docs=retrieved_docs,
+        )
+
+    metadata["context_expansion_latency_ms"] = (
+        time.perf_counter()
+        - context_expansion_start
+    ) * 1000
     context_docs = limit_docs(
         deduplicate_docs(
             context_docs
@@ -758,12 +795,13 @@ def ask_question(
     # 6. Memory retrieval
     # ------------------------------------------------------------------
 
+    memory_retrieval_start = time.perf_counter()
+
     if effective_user_id == "ragas_test":
         # Disable long-term memory during RAGAS so evaluation measures
         # retrieval + generation independently of previous test samples.
         memory_layer = None
         relevant_memories: list[dict[str, Any]] = []
-
     else:
         memory_layer = get_memory_layer(
             effective_user_id
@@ -774,6 +812,11 @@ def ask_question(
                 rewritten_question
             )
         )
+
+    metadata["memory_retrieval_latency_ms"] = (
+        time.perf_counter()
+        - memory_retrieval_start
+    ) * 1000
 
     metadata["memory_count"] = len(
         relevant_memories
@@ -806,12 +849,19 @@ def ask_question(
         model_name=model_name
     )
 
+    llm_start = time.perf_counter()
+
     try:
         response = llm.invoke(
             messages
         )
 
     except Exception:
+        metadata["llm_latency_ms"] = (
+            time.perf_counter()
+            - llm_start
+        ) * 1000
+
         logger.exception(
             "LLM call failed "
             "user_id=%s conversation_id=%s",
@@ -820,6 +870,10 @@ def ask_question(
         )
         raise
 
+    metadata["llm_latency_ms"] = (
+        time.perf_counter()
+        - llm_start
+    ) * 1000
 
     usage_metadata = extract_usage_metadata(
         response
@@ -872,6 +926,8 @@ def ask_question(
     ).isoformat()
 
     if memory_layer is not None:
+        memory_write_start = time.perf_counter()
+
         memory_layer.add_message(
             effective_conversation_id,
             "user",
@@ -885,6 +941,11 @@ def ask_question(
             answer,
             timestamp,
         )
+
+        metadata["memory_write_latency_ms"] = (
+            time.perf_counter()
+            - memory_write_start
+        ) * 1000
 
     # ------------------------------------------------------------------
     # 11. Return
