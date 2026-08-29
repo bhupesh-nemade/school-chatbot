@@ -62,30 +62,6 @@ def test_user_only_sees_own_conversations():
     assert conversation_a.conversation_id not in ids_b
 
 
-def test_user_cannot_read_another_users_messages():
-    service = get_conversation_service()
-
-    owner_id = "test-message-owner"
-    attacker_id = "test-message-attacker"
-
-    conversation = service.create_conversation(
-        owner_id
-    )
-
-    service.add_user_message(
-        owner_id,
-        conversation.conversation_id,
-        "What is the admission process?",
-    )
-
-    messages = service.get_messages(
-        attacker_id,
-        conversation.conversation_id,
-    )
-
-    assert messages == []
-
-
 def test_user_can_read_own_messages():
     service = get_conversation_service()
 

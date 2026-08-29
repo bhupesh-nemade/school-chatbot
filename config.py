@@ -194,6 +194,38 @@ HF_BASE_URL = (
 
 
 # ============================================================================
+# Semantic Cache
+# ============================================================================
+
+REDIS_URL = os.getenv(
+    "REDIS_URL",
+    "redis://localhost:6379",
+).strip()
+
+SEMANTIC_CACHE_ENABLED = os.getenv(
+    "SEMANTIC_CACHE_ENABLED",
+    "true",
+).strip().lower() in {"true", "1", "yes", "y"}
+
+SEMANTIC_CACHE_TTL_SECONDS = _get_int(
+    "SEMANTIC_CACHE_TTL_SECONDS",
+    3600,
+    minimum=1,
+)
+
+SEMANTIC_CACHE_DISTANCE_THRESHOLD = _get_float(
+    "SEMANTIC_CACHE_DISTANCE_THRESHOLD",
+    0.10,
+)
+# Validate threshold is between 0 and 2 (Redis COSINE distance)
+if not 0.0 <= SEMANTIC_CACHE_DISTANCE_THRESHOLD <= 2.0:
+    raise ValueError(
+        f"SEMANTIC_CACHE_DISTANCE_THRESHOLD must be between 0 and 2 "
+        f"(Redis COSINE distance), got {SEMANTIC_CACHE_DISTANCE_THRESHOLD}."
+    )
+
+
+# ============================================================================
 # Pinecone
 # ============================================================================
 

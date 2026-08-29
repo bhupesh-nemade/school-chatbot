@@ -101,6 +101,13 @@ def register_user(
 ) -> User:
     service = get_conversation_service()
 
+    # Name validation: reuse store's stricter check via _normalize_name logic
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name is required.")
+    if len(name) > 200:
+        raise ValueError("name is too long.")
+
     email = validate_email(
         email
     )
@@ -129,6 +136,18 @@ def register_user(
         is_verified=False,
     )
 
+    # Best-effort: create local identity mapping for the application user.
+    # This satisfies the user_identities design without breaking existing
+    # installations where the table may already be populated.
+    try:
+        service.create_user_identity(
+            user.user_id,
+            provider="local",
+            provider_user_id=user.user_id,
+        )
+    except Exception:
+        pass
+
     return user
 
 
@@ -149,9 +168,10 @@ def authenticate_user(
     if user is None:
         return None
 
-    if user.auth_provider != "local":
-        return None
-
+    # Do not reject non-local auth_provider users; a linked account
+    # retains its local password_hash and must remain usable via
+    # email/password even after Google linking. Require a password_hash
+    # instead of checking provider type.
     if not user.password_hash:
         return None
 
@@ -164,6 +184,14 @@ def authenticate_user(
     service.update_last_login(
         user.user_id
     )
+
+    # Best-effort: also update local identity last_login if present
+    try:
+        service.update_identity_last_login(
+            "local", user.user_id
+        )
+    except Exception:
+        pass
 
     return service.get_user_by_id(
         user.user_id
@@ -207,44 +235,78 @@ def authenticate_google_user(
     if not name:
         name = email.split("@")[0]
 
+    # 1. Stable Google identity lookup (sub) via user_identities
     user = service.get_user_by_identity(
-    provider="google",
-    provider_user_id=provider_user_id,
-)
+        provider="google",
+        provider_user_id=provider_user_id,
+    )
 
     if user is not None:
         service.update_last_login(
             user.user_id
         )
-
+        try:
+            service.update_identity_last_login(
+                "google", provider_user_id
+            )
+        except Exception:
+            pass
         return service.get_user_by_id(
             user.user_id
         )
 
-    # Link an existing local account if the verified
-    # Google email already exists.
+    # 2. Link an existing account only when the Google email is verified.
+    #    This prevents unverified Google emails from hijacking local accounts
+    #    and satisfies the "same verified email does not create duplicate"
+    #    requirement.
     existing_user = (
         service.get_user_by_email(email)
     )
 
     if existing_user is not None:
-        updated_user = service.update_user(
-            existing_user.user_id,
-            name=name,
-            auth_provider="google",
-            provider_user_id=provider_user_id,
-            is_verified=email_verified,
-        )
-
+        if not email_verified:
+            # Do not auto-link unverified emails; avoid duplicate users
+            # but users.email has UNIQUE constraint so we cannot create a
+            # second user with the same email. Raise a clear error.
+            raise ValueError(
+                "An account with this email already exists. "
+                "Please sign in with email/password to link."
+            )
+        # Verified email: link Google identity to existing application user
+        try:
+            service.create_user_identity(
+                existing_user.user_id,
+                provider="google",
+                provider_user_id=provider_user_id,
+            )
+        except ValueError:
+            # Already linked concurrently
+            pass
+        # Preserve original local password_hash; only update verification flag
+        # if Google confirms the email; do not overwrite auth_provider lossily.
+        if email_verified and not existing_user.is_verified:
+            try:
+                service.update_user(
+                    existing_user.user_id,
+                    is_verified=email_verified,
+                )
+            except Exception:
+                pass
         service.update_last_login(
-            updated_user.user_id
+            existing_user.user_id
         )
-
+        try:
+            service.update_identity_last_login(
+                "google", provider_user_id
+            )
+        except Exception:
+            pass
         return service.get_user_by_id(
-            updated_user.user_id
+            existing_user.user_id
         )
 
-    return service.create_user(
+    # 3. No existing user: create new application user + Google identity
+    new_user = service.create_user(
         name=name,
         email=email,
         password_hash=None,
@@ -252,3 +314,12 @@ def authenticate_google_user(
         provider_user_id=provider_user_id,
         is_verified=email_verified,
     )
+    try:
+        service.create_user_identity(
+            new_user.user_id,
+            provider="google",
+            provider_user_id=provider_user_id,
+        )
+    except ValueError:
+        pass
+    return service.get_user_by_id(new_user.user_id)

@@ -17,10 +17,18 @@ from chatbot.conversation_memory import get_memory_layer
 from chatbot.guardrails.input_guard import validate_input
 from chatbot.guardrails.output_guard import validate_output
 from chatbot.retriever import get_retriever, get_vectorstore
+from chatbot.semantic_cache import (
+    is_cache_eligible,
+    get_cached_response,
+    set_cached_response,
+)
 
 from config import (
     DEFAULT_MODEL,
     DEFAULT_USER_ID,
+    EMBEDDING_MODEL_NAME,
+    INDEX_VERSION,
+    CHUNKING_VERSION,
     HF_API_KEY,
     HF_BASE_URL,
     LLM_MAX_RETRIES,
@@ -30,19 +38,37 @@ from config import (
     LLM_TIMEOUT_SECONDS,
     MAX_CHAT_HISTORY_TURNS,
     MISTRAL_API_KEY,
-MISTRAL_BASE_URL,
-OXALPHA_API_KEY,
-OXALPHA_BASE_URL,
-OXALPHA_MODEL,
+    MISTRAL_BASE_URL,
+    OXALPHA_API_KEY,
+    OXALPHA_BASE_URL,
+    OXALPHA_MODEL,
     RAG_MAX_CONTEXT_CHARS,
     RAG_MAX_CONTEXT_DOCS,
     RAG_MAX_INITIAL_DOCS,
     RAG_NEIGHBOR_CHUNKS_PER_PAGE,
     RAG_NEIGHBOR_PAGE_WINDOW,
+    REDIS_URL,
+    SEMANTIC_CACHE_ENABLED,
+    SEMANTIC_CACHE_TTL_SECONDS,
+    SEMANTIC_CACHE_DISTANCE_THRESHOLD,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _terminal_log(message: str, *args: Any) -> None:
+    """Print important request/cache events to the Streamlit terminal.
+
+    Streamlit applications may not display module INFO logs depending on the
+    logging configuration. These explicit prints make request flow visible
+    without changing RAG/cache behavior.
+    """
+    try:
+        print(message % args if args else message, flush=True)
+    except Exception:
+        pass
+
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -115,6 +141,7 @@ def get_llm(
     #     raise ValueError(
     #         f"Unsupported LLM provider: {LLM_PROVIDER}"
     #     )
+
     if model_name == OXALPHA_MODEL:
         api_key = OXALPHA_API_KEY
         base_url = OXALPHA_BASE_URL
@@ -127,6 +154,7 @@ def get_llm(
         raise ValueError(
             f"Unsupported LLM provider: {LLM_PROVIDER}"
         )
+
     if not api_key:
         raise RuntimeError(
             f"API key missing for provider '{LLM_PROVIDER}'."
@@ -613,6 +641,12 @@ def ask_question(
     conversation_id: str | None = None,
     return_metadata: bool = False,
 ):
+    _terminal_log(
+        "\n[CHATBOT] QUESTION RECEIVED | user_id=%s | conversation_id=%s | question=%r",
+        user_id or DEFAULT_USER_ID,
+        conversation_id or "<auto>",
+        question,
+    )
     metadata: dict[str, Any] = {
     "status": "answered",
     "guardrail_reason": "",
@@ -632,6 +666,17 @@ def ask_question(
     "input_tokens": None,
     "output_tokens": None,
     "total_tokens": None,
+
+    # Semantic cache metadata (always present)
+    "cache_enabled": SEMANTIC_CACHE_ENABLED,
+    "cache_hit": False,
+    "cache_lookup_latency_ms": 0,
+    "cache_store_latency_ms": 0,
+    "cache_source": "disabled" if not SEMANTIC_CACHE_ENABLED else "semantic_miss",
+    "embedding_model": EMBEDDING_MODEL_NAME,
+    "index_version": INDEX_VERSION,
+    "chunking_version": CHUNKING_VERSION,
+    "cache_version": "1.0",
 }
 
     if chat_history is None:
@@ -649,6 +694,11 @@ def ask_question(
         metadata["status"] = "blocked"
         metadata["guardrail_reason"] = (
             guard_result.reason
+        )
+        _terminal_log(
+            "[CHATBOT] QUESTION BLOCKED | reason=%s | question=%r",
+            guard_result.reason,
+            question,
         )
 
         return format_ask_result(
@@ -697,6 +747,109 @@ def ask_question(
         question,
         chat_history,
     )
+
+    # ------------------------------------------------------------------
+    # 3b. Cache eligibility & lookup (before Pinecone)
+    # ------------------------------------------------------------------
+    # Generic history-free questions may use the shared semantic cache.
+    # Mem0 is intentionally not consulted for cache eligibility here:
+    # user-specific memory is retrieved later only after a cache miss.
+    was_cache_eligible = is_cache_eligible(
+        question=question,
+        chat_history=chat_history,
+        user_id=effective_user_id,
+        memory_layer=None,
+    )
+
+    _terminal_log(
+        "[CACHE] ELIGIBILITY | eligible=%s | history_turns=%d | user_id=%s",
+        was_cache_eligible,
+        len(chat_history),
+        effective_user_id,
+    )
+
+    cache_lookup_latency_ms: float | int = 0
+    cache_hit_flag = False
+    cache_source_val = metadata.get("cache_source", "semantic_miss")
+
+    if was_cache_eligible:
+        cached_answer, cache_lookup_metadata = get_cached_response(
+            question=question,
+        )
+        cache_lookup_latency_ms = cache_lookup_metadata.get(
+            "cache_lookup_latency_ms", 0
+        )
+
+        metadata["cache_lookup_latency_ms"] = cache_lookup_latency_ms
+        metadata["cache_source"] = cache_lookup_metadata.get(
+            "cache_source", "semantic_miss"
+        )
+        cache_source_val = metadata["cache_source"]
+
+        if cached_answer is not None and str(cached_answer).strip():
+            cache_hit_flag = True
+            metadata["cache_hit"] = True
+            metadata["cache_lookup_latency_ms"] = cache_lookup_latency_ms
+            metadata["cache_store_latency_ms"] = 0
+            metadata["cache_enabled"] = SEMANTIC_CACHE_ENABLED
+            metadata["status"] = "answered"
+            metadata["guardrail_reason"] = ""
+            metadata["retrieved_count"] = 0
+            metadata["context_count"] = 0
+            metadata["memory_count"] = 0
+            metadata["retrieval_latency_ms"] = 0
+            metadata["context_expansion_latency_ms"] = 0
+            metadata["memory_retrieval_latency_ms"] = 0
+            metadata["llm_latency_ms"] = 0
+            metadata["memory_write_latency_ms"] = 0
+            metadata["embedding_model"] = EMBEDDING_MODEL_NAME
+            metadata["index_version"] = INDEX_VERSION
+            metadata["chunking_version"] = CHUNKING_VERSION
+            metadata["cache_version"] = "1.0"
+
+            _terminal_log(
+                "[CACHE] HIT | lookup_latency_ms=%.2f | Pinecone=SKIPPED | LLM=SKIPPED",
+                cache_lookup_latency_ms,
+            )
+            logger.info(
+                "Semantic cache HIT (latency %.2fms, eligible)",
+                cache_lookup_latency_ms,
+            )
+
+            return format_ask_result(
+                answer=str(cached_answer).strip(),
+                docs=[],
+                metadata=metadata,
+                return_metadata=return_metadata,
+            )
+        else:
+            metadata["cache_hit"] = False
+            metadata["cache_lookup_latency_ms"] = cache_lookup_latency_ms
+            metadata["cache_store_latency_ms"] = 0
+            _terminal_log(
+                "[CACHE] MISS | lookup_latency_ms=%.2f | continuing to Pinecone + LLM",
+                cache_lookup_latency_ms,
+            )
+            logger.info(
+                "Semantic cache MISS (latency %.2fms)",
+                cache_lookup_latency_ms,
+            )
+    else:
+        metadata["cache_hit"] = False
+        metadata["cache_lookup_latency_ms"] = 0
+        metadata["cache_store_latency_ms"] = 0
+        if SEMANTIC_CACHE_ENABLED and chat_history:
+            metadata["cache_source"] = "bypass_chat_history"
+        elif SEMANTIC_CACHE_ENABLED:
+            if metadata.get("cache_source") == "semantic_miss":
+                metadata["cache_source"] = "bypass_not_eligible"
+
+        _terminal_log(
+            "[CACHE] BYPASS | source=%s",
+            metadata.get("cache_source", "bypass_not_eligible"),
+        )
+
+    # End of cache eligibility & lookup block.
 
     # ------------------------------------------------------------------
     # 4. Primary retrieval
@@ -751,7 +904,7 @@ def ask_question(
     # 5. Context expansion
     # ------------------------------------------------------------------
 
- 
+
 
     context_expansion_start = time.perf_counter()
 
@@ -918,6 +1071,76 @@ def ask_question(
     )
 
     # ------------------------------------------------------------------
+    # 10b. Cache store (after successful generation + output guard)
+    # ------------------------------------------------------------------
+    # Only store when request was cache eligible at lookup time, LLM
+    # generation succeeded, answer is non-empty and passed output guard.
+    # Never cache fallback/error/blocked or personalized responses.
+    cache_store_start = time.perf_counter()
+    if (
+        was_cache_eligible
+        and answer
+        and str(answer).strip()
+        and answer.strip() != FALLBACK_MESSAGE
+        and metadata.get("status") != "blocked"
+    ):
+        try:
+            cache_store_key = set_cached_response(
+                question=question,
+                answer=answer,
+                metadata={
+                    "model_name": model_name,
+                    "index_version": INDEX_VERSION,
+                    "chunking_version": CHUNKING_VERSION,
+                    "embedding_model": EMBEDDING_MODEL_NAME,
+                    "cache_version": "1.0",
+                },
+                ttl=SEMANTIC_CACHE_TTL_SECONDS,
+            )
+            cache_store_latency_ms = (time.perf_counter() - cache_store_start) * 1000
+            metadata["cache_store_latency_ms"] = round(cache_store_latency_ms, 2)
+            if cache_store_key:
+                _terminal_log(
+                    "[CACHE] STORE COMPLETED | latency_ms=%.2f | key=%s",
+                    cache_store_latency_ms,
+                    cache_store_key,
+                )
+                logger.info(
+                    "Semantic cache STORE completed in %.2fms (key=%s)",
+                    cache_store_latency_ms,
+                    cache_store_key,
+                )
+            else:
+                _terminal_log(
+                    "[CACHE] STORE SKIPPED/FAILED | latency_ms=%.2f",
+                    cache_store_latency_ms,
+                )
+                logger.info(
+                    "Semantic cache STORE skipped/failed in %.2fms",
+                    cache_store_latency_ms,
+                )
+        except Exception:
+            cache_store_latency_ms = (time.perf_counter() - cache_store_start) * 1000
+            metadata["cache_store_latency_ms"] = round(cache_store_latency_ms, 2)
+            _terminal_log(
+                "[CACHE] STORE ERROR | cache failure did not break the chatbot | error=%s",
+                "see traceback in logs",
+            )
+            logger.warning(
+                "Semantic cache store failed after successful generation. "
+                "Treating as cache miss for this request.",
+                exc_info=True,
+            )
+    else:
+        metadata["cache_store_latency_ms"] = 0
+        if not was_cache_eligible:
+            logger.debug("Semantic cache STORE skipped: not eligible")
+        elif not answer or not str(answer).strip():
+            logger.debug("Semantic cache STORE skipped: empty answer")
+        elif answer.strip() == FALLBACK_MESSAGE:
+            logger.debug("Semantic cache STORE skipped: fallback answer")
+
+    # ------------------------------------------------------------------
     # 10. Long-term memory
     # ------------------------------------------------------------------
 
@@ -951,6 +1174,16 @@ def ask_question(
     # 11. Return
     # ------------------------------------------------------------------
 
+    _terminal_log(
+        "[CHATBOT] QUESTION COMPLETED | status=%s | cache_hit=%s | "
+        "cache_lookup_ms=%s | cache_store_ms=%s | retrieval_ms=%s | llm_ms=%s",
+        metadata.get("status", "answered"),
+        metadata.get("cache_hit", False),
+        metadata.get("cache_lookup_latency_ms", 0),
+        metadata.get("cache_store_latency_ms", 0),
+        metadata.get("retrieval_latency_ms"),
+        metadata.get("llm_latency_ms"),
+    )
     return format_ask_result(
         answer=answer,
         docs=context_docs,
